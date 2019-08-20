@@ -10,6 +10,13 @@ git submodule update
 cd ..
 ```
 
+Then add the following to your `.bashrc`, which prevents Java stack overflow and other errors.
+The sizes can be further increased if needed.
+
+```
+export _JAVA_OPTIONS="-Xms1024m -Xss256m -Xmx16g -XX:MaxMetaspaceSize=16g"
+```
+
 2. Install [TensorFlow](https://github.com/tensorflow/tensorflow) from source. The compiler can work by installing only the python API, however the 
 [graph transform tools](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/tools/graph_transforms/README.md) used by the first optimization level need to be built with bazel and require installation from source. We built and tested using version 1.12.0 and Python 2.7.6.
 
