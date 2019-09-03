@@ -7,6 +7,7 @@ git clone git://github.com/stanford-ppl/spatial-multiverse.git
 cd spatial-multiverse/spatial
 git submodule init
 git submodule update
+make install
 cd ..
 ```
 
@@ -17,9 +18,13 @@ The sizes can be further increased if needed.
 export _JAVA_OPTIONS="-Xms1024m -Xss256m -Xmx16g -XX:MaxMetaspaceSize=16g"
 ```
 
-2. Install [TensorFlow](https://github.com/tensorflow/tensorflow) from source. The compiler can work by installing only the python API, however the 
-[graph transform tools](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/tools/graph_transforms/README.md) used by the first optimization level need to be built with bazel and require installation from source. We built and tested using version 1.12.0 and Python 2.7.6.
+2. Install [TensorFlow](https://github.com/tensorflow/tensorflow) using:
 
-3. Compile Spatial in the `spatial` subdirectory of this repository by following the installation instructions [here](https://github.com/stanford-ppl/spatial#getting-started). Note: you do not need to clone Spatial, only compile it. This repository already contains Spatial as a submodule that points to the correct branch.
+```
+sudo pip install tensorflow==1.14.0
+```
 
-4. If you want to run on the Amazon F1, you will need to set up [aws-fpga](https://github.com/aws/aws-fpga). Modify your `.bashrc` to set `AWS_HOME` and to source `hdk_setup.sh` and `sdk_setup.sh`. For more details you can read the AWS tutorial [here](aws.md).
+Any recent build should work, but we originally built and tested using version 1.12.0 and Python 2.7.6.
+When later adding MobileNet support, we had moved to version 1.14.0.
+
+3. If you want to run on the Amazon F1, you will need to set up [aws-fpga](https://github.com/aws/aws-fpga). Modify your `.bashrc` to set `AWS_HOME` and to source `hdk_setup.sh` and `sdk_setup.sh`. For more details you can read the AWS tutorial [here](aws.md).

@@ -16,6 +16,11 @@
 
 import utils
 import os
+import tensorflow as tf
+from tensorflow.python.saved_model import tag_constants
+from tensorflow.python.tools import freeze_graph
+from tensorflow.python import ops
+from tensorflow.tools.graph_transforms import TransformGraph
 
 
 # ========================================================================================================
@@ -51,71 +56,47 @@ DESIRED_BATCH_SIZE = 1
 
 # The graph is now frozen, so we can run optimizations like constant folding. This works even for graphs
 # with Switch/Merge because control inputs were folded in by the previous script, create_inference_graph.py.
-#
-# This optimization script is based on these:
-#     https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/tools/optimize_for_inference.py  (now deprecated by TensorFlow)
-#     https://github.com/tensorflow/tensorflow/blob/master/tensorflow/tools/graph_transforms/README.md
 
-print 'Generating commands for TensorFlow graph optimization passes.'
-print 'The user needs to navigate to installed tensorflow/ directory and run these.'
+def get_graph_def_from_file(graph_filepath):
+  tf.reset_default_graph()
+  with ops.Graph().as_default():
+    with tf.gfile.GFile(graph_filepath, 'rb') as f:
+      graph_def = tf.GraphDef()
+      graph_def.ParseFromString(f.read())
+      return graph_def
 
-cmd = '''
-bazel-bin/tensorflow/tools/graph_transforms/transform_graph \
---in_graph=''' + model_no_ext + '''.pb \
---out_graph=''' + model_no_ext + '''_opt1.pb \
---inputs=\'''' + input_node + '''\' \
---outputs=\'''' + output_node + '''\' \
---transforms='
-  strip_unused_nodes(type=float, shape="''' + str(DESIRED_BATCH_SIZE) + ''',''' + input_dims + '''")
-  remove_nodes(op=Identity, op=CheckNumerics)
-  fold_constants(use_saved_model=false)
-  fold_batch_norms
-  fold_old_batch_norms
-  fuse_pad_and_conv
-  fuse_resize_and_conv
-  fuse_resize_pad_and_conv
-  merge_duplicate_nodes
-  remove_control_dependencies
-  sort_by_execution_order'
-'''
-# os.system(cmd)
-print cmd
+def optimize_graph(model_dir, graph_filename, transforms, output_names, outname):
+  input_names = [input_node]
+  graph_def = get_graph_def_from_file(os.path.join(model_dir, graph_filename))
+  optimized_graph_def = TransformGraph(
+      graph_def,
+      input_names,  
+      output_names,
+      transforms)
+  tf.train.write_graph(optimized_graph_def,
+                      logdir=model_dir,
+                      as_text=False,
+                      name=outname)
 
-# Run the command again in case there are unresolved dependencies
+model_dir  = '/'.join(model_no_ext.split('/')[:-1])
+model_name = model_no_ext.split('/')[-1]
 
-cmd = '''
-bazel-bin/tensorflow/tools/graph_transforms/transform_graph \
---in_graph=''' + model_no_ext + '''_opt1.pb \
---out_graph=''' + model_no_ext + '''_opt2.pb \
---inputs=\'''' + input_node + '''\' \
---outputs=\'''' + output_node + '''\' \
---transforms='
-  strip_unused_nodes(type=float, shape="''' + str(DESIRED_BATCH_SIZE) + ''',''' + input_dims + '''")
-  remove_nodes(op=Identity, op=CheckNumerics)
-  fold_constants(use_saved_model=false)
-  fold_batch_norms
-  fold_old_batch_norms
-  fuse_pad_and_conv
-  fuse_resize_and_conv
-  fuse_resize_pad_and_conv
-  merge_duplicate_nodes
-  remove_control_dependencies
-  sort_by_execution_order'
-'''
-# os.system(cmd)
-print cmd
+transforms = ['strip_unused_nodes(type=float, shape="' + str(DESIRED_BATCH_SIZE) + ',' + input_dims + '")'
+  'remove_nodes(op=Identity, op=CheckNumerics)',
+  'fold_constants(use_saved_model=false)',
+  'fold_batch_norms',
+  'fold_old_batch_norms',
+  'fuse_pad_and_conv',
+  'fuse_resize_and_conv',
+  'fuse_resize_pad_and_conv',
+  'merge_duplicate_nodes',
+  'remove_control_dependencies',
+  'sort_by_execution_order']
+optimize_graph(model_dir, model_name + '.pb',
+               transforms, [output_node], outname= model_name + '_opt1.pb')
+optimize_graph(model_dir, model_name + '_opt1.pb',
+               transforms, [output_node], outname= model_name + '_opt2.pb')
 
-print '''
-
-Run the commands above. They need the transform_graph utility to have been built. If this has not yet been
-built, you can build it by running:
-
-  bazel build tensorflow/tools/graph_transforms:transform_graph
-
-Then cd to your tensorflow/ root dir and run the two commands above.
-
-'''
-
-print 'This will write the optimized graph to ' + model_no_ext + '_opt2.pb'
+print 'The optimized graph has been written to ' + model_no_ext + '_opt2.pb'
 print '==> Next step: generate Spatial for this optimized graph by running:'
 print '      $ python dnn_to_spatial.py ' + model_no_ext + '_opt2.pb'

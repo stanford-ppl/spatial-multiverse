@@ -51,11 +51,12 @@ def write_summary_file(name, sess, graph_def, imported=False):
         f.write('  output size = ' + str(sess.graph.get_tensor_by_name(prefix + node.name + ':0').get_shape()) + "\n")
       except:
         f.write('  output size = 0' + "\n")
-      if node.op == 'Conv2D':
+      if node.op in ['Conv2D', 'DepthwiseConv2dNative']:
         f.write('  padding = ' + str(node.attr['padding'].s) + "\n")
         f.write('  stride = ' + str(node.attr['strides'].list.i) + "\n")
         # f.write('  stride = ' + str(node.attr['strides'].list.i[1]) + "\n")
-        f.write('  k = ' + str(sess.graph.get_tensor_by_name(prefix + node.input[1] + ':0').get_shape().as_list()[1]) + "\n")
+        # f.write('  k = ' + str(sess.graph.get_tensor_by_name(prefix + node.input[1] + ':0').get_shape().as_list()[1]) + "\n")
+        f.write('  k = ' + str(sess.graph.get_tensor_by_name(prefix + node.input[1] + ':0').get_shape()) + "\n")
       elif node.op == 'MaxPool':
         f.write('  stride = ' + str(node.attr['strides'].list.i) + "\n")
         f.write('  k = ' + str(node.attr['ksize'].list.i) + "\n")

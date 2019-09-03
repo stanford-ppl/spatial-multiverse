@@ -2,7 +2,7 @@ This directory contains the pre-trained ResNet example with the optimization scr
 It is the original ResNet model used by He et al., converted to TensorFlow [here](https://github.com/ry/tensorflow-resnet).
 To run this network,
 
-1. Call `dnn_to_spatial.py` on this graph, e.g. `python dnn_to_spatial.py models/resnet/ResNet50_opt.pb`
+1. Call `dnn_to_spatial.py` on this graph, e.g. `python dnn_to_spatial.py models/resnet/ResNet50_opt.pb`. You may also want to print ImageNet classification, if so see the instructions [here](../../docs/demo.md).
 
 2. Follow the instructions printed to move the generated file `resnet50opt.scala` to the Spatial apps directory and compile using Spatial
 

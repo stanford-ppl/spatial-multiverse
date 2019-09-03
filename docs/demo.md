@@ -43,25 +43,7 @@ Next, optimize it using TensorFlow's graph utilities:
 python  optimize_inference_graph.py  models/resnet_official/resnet_official.pb  input_tensor  softmax_tensor  224,224,3
 ```
 
-This script will print commands to run. Navigate to your TensorFlow installation directory and run them.
-To resolve dependencies between optimization passes, `optimize_inference_graph.py` will have printed two commands.
-For example, the first command may be:
-
-```
-cd /home/user/tensorflow/tensorflow
-bazel-bin/tensorflow/tools/graph_transforms/transform_graph --in_graph=/home/user/spatial-multiverse/models/resnet_official/resnet_official.pb --out_graph=/home/user/spatial-multiverse/models/resnet_official/resnet_official_opt1.pb --inputs='input_tensor' --outputs='softmax_tensor' --transforms='
-  strip_unused_nodes(type=float, shape="1,224,224,3")
-  remove_nodes(op=Identity, op=CheckNumerics)
-  fold_constants(use_saved_model=false)
-  fold_batch_norms
-  fold_old_batch_norms
-  fuse_pad_and_conv
-  fuse_resize_and_conv
-  fuse_resize_pad_and_conv
-  merge_duplicate_nodes
-  remove_control_dependencies
-  sort_by_execution_order'
-```
+This script will create a new optimized graph.
 
 For LeNet and the Original ResNet, the optimized models are already included in the models directory.
 

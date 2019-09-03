@@ -13,7 +13,7 @@ python create_inference_graph.py saved_model models/resnet/resnet_v1_fp32_savedm
 
 python  optimize_inference_graph.py  models/resnet_official/resnet_official.pb  input_tensor  softmax_tensor  224,224,3
 
-# Follow the instructions printed by the previous command to navigate to your TensorFlow installation and run the TensorFlow graph utilities
+# You may also want to print ImageNet classification, if so see the instructions [here](../../docs/demo.md)
 
 python dnn_to_spatial.py models/resnet_official/resnet_official_opt2.pb
 ```

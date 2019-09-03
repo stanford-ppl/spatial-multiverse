@@ -92,6 +92,8 @@ reuse_layer_to_kxk = {}
 reuse_FC_name = ''
 include_sigmoid_initialization = False
 fc_section = False
+max_depthwise_conv_input = None
+processed_softmax = False
 
 
 # ========================================================================================================
@@ -163,7 +165,7 @@ weight_files_to_concat = []
 
 input_ops = ['Placeholder', 'DecodeJpeg']#, 'RandomUniform']
 
-ops_to_skip = ['Softmax', 'Identity', 'NoOp', 'Squeeze']
+ops_to_skip = ['Softmax', 'Identity', 'NoOp', 'Squeeze', 'Shape']
 
 # If we see these and they connect to a jpeg, skip them in Accel and do the op
 # on host instead (e.g. decode, resize + interpolate using a Scala library)
@@ -270,6 +272,22 @@ for node in output_graph_def.node:
 # Alternatively can always re-use (i.e. >1)
 if num_matmul > device_params['num_SLR_regions']:
   reuse_FC = True
+
+# Initial traversal: If Relu is used, see if Relu or Relu6
+num_relu  = 0
+num_relu6 = 0
+for node in output_graph_def.node:
+  if node.op == 'Relu':
+    num_relu += 1
+  elif node.op == 'Relu6':
+    num_relu6 += 1
+# For now assuming only one type is used, but not hard to support both,
+# just need to add another mux.
+assert num_relu == 0 or num_relu6 == 0
+if num_relu6 > 0:
+  use_relu6 = True
+else:
+  use_relu6 = False
 
 # Initial traversal: ops with no inputs
 # Make a directory for weights
@@ -655,6 +673,11 @@ while(True):
     # Reshape also short-circuits below when 1D to 1D
     if node.input[0] in name_to_tmpvar.keys():
       name_to_tmpvar[node.name] = name_to_tmpvar[node.input[0]]
+    if node.op == 'Softmax':
+      processed_softmax = True
+    continue
+  # Or force user to pick output as Softmax or before
+  if processed_softmax:
     continue
 
   # ------------------------------------------------------------------------------------------------------
@@ -755,11 +778,16 @@ while(True):
         curr_idx += 1
         continue
       # If match, add to list
+      # Can refactor this
       if node.op == fusion_pattern[curr_fusion_pattern_op]:
         fusion_nodes.append(node)
         curr_fusion_pattern_op += 1
         curr_idx += 1
       elif node.op in ['Add', 'BiasAdd'] and fusion_pattern[curr_fusion_pattern_op] in ['Add', 'BiasAdd']:
+        fusion_nodes.append(node)
+        curr_fusion_pattern_op += 1
+        curr_idx += 1
+      elif node.op in ['Relu', 'Relu6'] and fusion_pattern[curr_fusion_pattern_op] in ['Relu', 'Relu6']:
         fusion_nodes.append(node)
         curr_fusion_pattern_op += 1
         curr_idx += 1
@@ -1060,6 +1088,191 @@ while(True):
           '''
       return conv_loop
   
+  # Can merge w/ generate_sliding_window
+  def generate_sliding_window_depthwise(in_name, out_name, padding, out_compute_rows, out_compute_cols, weight_read_str, half_kernel_size, c_par, \
+    load_data_from_dram=True, weight_blocking=True, use_linebuf=False):
+      
+      # Note: using c_par instead of inB_par because inB can = 1
+      
+      conv_loop = ''
+      
+      # Find proper indentation      
+      if not load_data_from_dram:
+        indent = '  '
+      elif not use_linebuf:
+        indent = '    '   # One more loop since can't fuse in_channels loop
+      else:
+        indent = '      ' # One more loop for loading rows
+      
+      # Check if weights are loaded in blocks
+      if weight_blocking:
+        b_idx_end = ', ib'
+      else:
+        b_idx_end = ''
+      
+      # Data is in DRAM so we could not fuse the in_channels loop with the rows/columns loop
+      # Print the extra loop here
+      if load_data_from_dram:
+        conv_loop += '''
+      ''' + indent
+        if use_linebuf:
+          conv_loop += '''
+      ''' + indent + '''Foreach(0 until ''' + out_compute_cols + ''' par ''' + c_par + ''', 0 until inB) { (c,ib) =>'''
+        else:
+          conv_loop += '''
+      ''' + indent + '''Foreach(0 until ''' + out_compute_rows + ''', 0 until ''' + out_compute_cols + ''' par ''' + c_par + ''', 0 until inB) { (r,c,ib) =>'''
+      conv_loop += '''
+      ''' + indent
+      
+      # Can use mux here instead of *s
+      
+      # For VALID padding, row_start, row_end, col_start, col_end, can be simplified
+      # But this might not affect performance or util, only make the generated code simpler, so maybe not
+      # worth making this function more complicated. If this is always set to True, correctness should not
+      # change (it makes this function simpler but generated code will be longer than necessary for VALID padding)
+      check_bounds = True
+      if padding == 'VALID':
+        check_bounds = False
+      # Initialize data loading bounds
+      if check_bounds:
+        if use_linebuf:
+          conv_loop += '''  
+      ''' + indent + '''  val row_start = min((kr-1).to[Int], max(0.to[Int], (kr-1-r.to[Int]*s.to[Int]   ).to[Int]) )
+      ''' + indent + '''  val row_end   = min((kr  ).to[Int], max(1.to[Int], (kr+nr-1-r.to[Int]*s.to[Int]).to[Int]) )'''
+        else:
+          conv_loop += '''
+      ''' + indent + '''  val row_start = min((kr-1).to[Int], max(0.to[Int], (kr_ignore-r.to[Int]*s.to[Int]   ).to[Int]) )
+      ''' + indent + '''  val row_end   = min((kr  ).to[Int], max(1.to[Int], (nr+kr_ignore-r.to[Int]*s.to[Int]).to[Int]) )'''
+        conv_loop += '''
+      ''' + indent + '''  val col_start = min((kc-1).to[Int], max(0.to[Int], (kc_ignore-c.to[Int]*s.to[Int]   ).to[Int]) )
+      ''' + indent + '''  val col_end   = min((kc  ).to[Int], max(1.to[Int], (nc+kc_ignore-c.to[Int]*s.to[Int]).to[Int]) )'''
+      # If line buffers are used, row_start check is still needed
+      elif use_linebuf:
+        conv_loop += '''  
+      ''' + indent + '''  val row_start = max(0.to[Int], (kr-1-r.to[Int]*s.to[Int]   ).to[Int])'''
+
+      # Print weight load
+      conv_loop += '''
+      ''' + indent + '''  
+      ''' + indent + '''  val kernel: List[T] = List.tabulate(kr){i => List.tabulate(kc){j => 
+      ''' + indent + '''    ''' + weight_read_str + '''
+      ''' + indent + '''  }}.flatten
+      ''' + indent + '''  '''
+      
+      # Get data read string
+      column_skip_str = ''
+      if check_bounds:
+        column_skip_str = '-kc_ignore'
+      if not load_data_from_dram:
+        data_idx_str = in_name + '_SRAM(inCh_i, i.to[Int]-kr_ignore+r.to[Int], j.to[Int]' + column_skip_str + '+c.to[Int])'
+      elif use_linebuf:
+        data_idx_str = in_name + '(kr-i,j.to[Int]' + column_skip_str + '+c.to[Int]*s.to[Int])'  # Can use mux here
+      else:
+        data_idx_str = in_name + '((i.to[Int]-kr_ignore+mux(s==1,r,r*2))*nc + j.to[Int]' + column_skip_str + '+mux(s==1,c,c*2))'
+        
+      # Specialize data read for different paddings
+      if check_bounds:
+        conv_loop += '''
+      ''' + indent + '''  val data: List[T] = List.tabulate(kr){i => List.tabulate(kc){j => 
+      ''' + indent + '''  
+      ''' + indent + '''    if (i < ''' + str(half_kernel_size) + ''' && j < ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''      mux((i < row_start || j < col_start),
+      ''' + indent + '''        0.to[T],
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''      )
+      ''' + indent + '''    }
+      ''' + indent + '''    else if (i == ''' + str(half_kernel_size) + ''' && j < ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''      mux((j < col_start),
+      ''' + indent + '''        0.to[T],
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''      )
+      ''' + indent + '''    }
+      ''' + indent + '''    else if (i > ''' + str(half_kernel_size) + ''' && j < ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''      mux((i+1 > row_end || j < col_start),
+      ''' + indent + '''        0.to[T],
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''      )
+      ''' + indent + '''    }
+      ''' + indent + '''    
+      ''' + indent + '''    else if (i < ''' + str(half_kernel_size) + ''' && j == ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''      mux((i < row_start),
+      ''' + indent + '''        0.to[T],
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''      )
+      ''' + indent + '''    }
+      ''' + indent + '''    else if (i == ''' + str(half_kernel_size) + ''' && j == ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''    }
+      ''' + indent + '''    else if (i > ''' + str(half_kernel_size) + ''' && j == ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''      mux((i+1 > row_end),
+      ''' + indent + '''        0.to[T],
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''      )
+      ''' + indent + '''    }
+      ''' + indent + '''    
+      ''' + indent + '''    else if (i < ''' + str(half_kernel_size) + ''' && j > ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''      mux((i < row_start || j+1 > col_end),
+      ''' + indent + '''        0.to[T],
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''      )
+      ''' + indent + '''    }
+      ''' + indent + '''    else if (i == ''' + str(half_kernel_size) + ''' && j > ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''      mux((j+1 > col_end),
+      ''' + indent + '''        0.to[T],
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''      )
+      ''' + indent + '''    }
+      ''' + indent + '''    else {// if (i > ''' + str(half_kernel_size) + ''' && j > ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''      mux((i+1 > row_end || j+1 > col_end),
+      ''' + indent + '''        0.to[T],
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''      )
+      ''' + indent + '''    }
+      ''' + indent + '''  }}.flatten'''
+      
+      elif use_linebuf:
+        conv_loop += '''
+      ''' + indent + '''  val data: List[T] = List.tabulate(kr){i => List.tabulate(kc){j => 
+      ''' + indent + '''    if (i < ''' + str(half_kernel_size) + ''') {
+      ''' + indent + '''      mux((i < row_start),
+      ''' + indent + '''        0.to[T],
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''      )
+      ''' + indent + '''    }
+      ''' + indent + '''    else {
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''    }
+      ''' + indent + '''  }}.flatten'''
+      
+      else:
+        conv_loop += '''
+      ''' + indent + '''  val data: List[T] = List.tabulate(kr){i => List.tabulate(kc){j => 
+      ''' + indent + '''        ''' + data_idx_str + '''
+      ''' + indent + '''  }}.flatten'''
+      
+      # Print accumulation
+      conv_loop += '''
+      ''' + indent + '''  
+      ''' + indent + '''  val window_sum = ReduceTree(data.zip(kernel).map{case (data_i, kernel_i) => data_i * kernel_i} :_*){_+_}'''
+      if use_linebuf:
+        conv_loop += '''
+      ''' + indent + '''  if (r >= kr_ignore) {
+      ''' + indent + '''    ''' + out_name + '''_SRAM_conv(r.to[Int]-kr_ignore, c, ib) = window_sum
+      ''' + indent + '''  }'''
+      else:
+        conv_loop += '''
+      ''' + indent + '''  ''' + out_name + '''_SRAM_conv(r, c''' + b_idx_end + ''') = window_sum'''
+      
+      # Close indents
+      conv_loop += '''
+          }
+      ''' + indent
+      if load_data_from_dram:
+        if use_linebuf:
+          conv_loop += '''
+            }'''
+      return conv_loop
+  
   # Convolution node prior to other fused operations
   def conv_before_fusion(is_input, tmpvar, tmpvar_inputs, bias_tmpvar_inputs, bias_kernel_dims_str, \
     data_dims_str, kernel_dims_str, strides, padding, out_dims_str, final_out_size, make_reuse_def):
@@ -1149,9 +1362,12 @@ while(True):
       if not conv_input_output_from_DRAM:
         utils.error_exit('1x1 Convolution currently assumes input / output in DRAM')
               
-      # Line Buffer is not needed for 1x1, so instead here re-order loops to load a block of rows
-      if use_line_buffer(data_dims_str):
-        utils.error_exit('Larger buffer sizes for 1x1 Convolution not yet implemented')      
+      # # Line Buffer is not needed for 1x1, so instead here re-order loops to load a block of rows
+      # if use_line_buffer(data_dims_str):
+      #   # There are 2 ways of doing this, either storing the outputs in blocks of rows x cols x B,
+      #   # or storing the outputs in blocks of rows x cols_block x B. Currently doing the first option 
+      #   # below with smaller B. Can implement first option here as well.
+      #   utils.error_exit('Larger buffer sizes for 1x1 Convolution not yet implemented')      
       
       # Currently, inB below is calculated statically and put into a LUT
       # (see top of Convolution operation processing below)
@@ -1162,9 +1378,14 @@ while(True):
         '''
       
       layer_OP = '{{{REUSE_NAME}}}_OP'
-      layer_WLP = 8
-      layer_DLP = 16
-      layer_SP = 8
+      if use_line_buffer(data_dims_str):
+        layer_DLP = 4
+        layer_WLP = 2 # Can make this 1, and then instead of layer_WLP/2 below, do max(1, layer_WLP/2)
+        layer_SP = 1
+      else:
+        layer_DLP = 16
+        layer_WLP = 8
+        layer_SP = 8
       
       if bias_tmpvar_inputs and bias_kernel_dims_str:
         if make_reuse_def:
@@ -1199,7 +1420,12 @@ while(True):
       # However, it also exists as a constant in the code (in this script it is in the variable
       # img2D_size, which is MAX__in2D_aligned).
       in2D_size = int(data_dims_str[0])*int(data_dims_str[1])
-      inChannel_block_size = closest_pow_2(device_params['image_buffer_size'] / in2D_size)
+      if use_line_buffer(data_dims_str):
+        inChannel_block_size = 1 # can make this closest_pow_2(max_in2D_size / in2D_size)
+        layer_B  = 4
+        layer_IP = 4
+      else:
+        inChannel_block_size = closest_pow_2(device_params['image_buffer_size'] / in2D_size)
       load_size = inChannel_block_size*in2D_size
       
       if not make_reuse_def:
@@ -1493,8 +1719,8 @@ while(True):
         kr_ignore_check = str( int( math.ceil( float(int(kernel_dims_str[0]) - pad_top )/float(stride) ) - 1 ))
         assert kr_ignore_check == kr_ignore
       else:
-        kr_ignore = str( pad_top )
-      kc_ignore = str( pad_left )
+        kr_ignore = str( pad_top ) #'((kr - s)/2).to[Int]'
+      kc_ignore = str( pad_left ) #'((kc - s)/2).to[Int]'
       half_kernel_size = int(int(kernel_dims_str[0])/2)
       # print kernel_dims_str[0] + ':  kr_ignore = ' + kr_ignore + ', kc_ignore = ' + kc_ignore
       
@@ -1541,6 +1767,7 @@ while(True):
           val kr_ignore = ''' + kr_ignore + '''
           val kc_ignore = ''' + kc_ignore + '''
           val s = ''' + stride_str
+           # If no Pad(), should be (k-s)/2, and same for kr_ignore if no LB
       if conv_input_output_from_DRAM:
         output_string += '''
         
@@ -1613,6 +1840,8 @@ while(True):
           output_string += '''
           Pipe.II(1).Foreach(''' + memreduce_iter + ''' by 1, 0 until or, 0 until oc) { (inCh_i,r,c) =>'''
       
+      # If data is on-chip, no need to re-load from DRAM so fuse the in channels loop with r/c/b and
+      # keep the weight load for all in channels outside
       if conv_input_output_from_DRAM and not weights_small_B_no_reshape:
         layer_WLP = 8
         layer_DLP = 4
@@ -1624,7 +1853,7 @@ while(True):
             ''' + weight_name + '''_SRAM load ''' + weight_dram_name + '''_DRAM(weights_start_idx + inCh_i.to[Int], kr*kc*outCh_i.to[Int]::kr*kc*(outCh_i.to[Int]+B) par WLP_L''' + str(global_val_number) + ''')'''
         else:
           output_string += '''
-            ''' + weight_name + '''_SRAM load ''' + weight_name + '''_DRAM(inCh_i.to[Int], kr*kc*outCh_i.to[Int]::kr*kc*(outCh_i.to[Int]+B) par WLP_L''' + str(global_val_number) + ''')'''
+            ''' + weight_name + '''_SRAM load ''' + weight_dram_name + '''_DRAM(inCh_i.to[Int], kr*kc*outCh_i.to[Int]::kr*kc*(outCh_i.to[Int]+B) par WLP_L''' + str(global_val_number) + ''')'''
         output_string += '''
             val ''' + weight_name + '''_SRAM_reshape = SRAM[T](B,kr*kc).hierarchical.noduplicate
             Foreach(kr*kc by 1, B by 1 par WLP_L''' + str(global_val_number) + '''/2) { (ij, b) =>
@@ -1721,7 +1950,148 @@ while(True):
       dse_string += '  val SP_L' + str(global_val_number) + '  = ' + str(layer_SP) + "\n"
     dse_string += "\n"
 
-    return output_string, dse_string, weight_blocking
+    return output_string, dse_string, weight_blocking, layer_IP
+  
+  # Convolution node prior to other fused operations
+  # Note: Can merge w/ conv_before_fusion
+  def conv_before_fusion_depthwise(is_input, tmpvar, tmpvar_inputs, bias_tmpvar_inputs, bias_kernel_dims_str, \
+    data_dims_str, kernel_dims_str, strides, padding, out_dims_str, final_out_size, make_reuse_def):
+  
+    # Initializations
+    output_string = ''
+    dse_string = ''
+    layer_IP = 1
+    layer_OP = 1
+    layer_WLP = 1
+    # layer_DLP = 1
+    # layer_SP = 1
+    
+    assert strides[1] == strides[2]
+    stride = strides[1]
+    
+    # Depthwise conv is currently implemented for the most common cases
+    # (SAME padding, k>1, inputs/outputs to DRAM). To handle all cases,
+    # i.e. if the assertions below fail, then merge this def with 
+    # conv_before_fusion, since then they would be similar.
+    
+    assert make_reuse_def
+    if make_reuse_def:
+      # out_channels = 'out_channels'   # Currently assumed to be same as in_channels
+      out_name = 'out'
+      img2D_size = 'MAX__in2D_aligned'
+      line_in_cols_sram = 'MAX__nc' #'MAX__nc_aligned'
+      weight_name = 'weight'
+      weight_dram_name = '{{{REUSE_NAME}}}_weights_concat'
+      memreduce_iter = 'in_channels'
+      out_sram_cols = 'MAX__oc'
+      out_sram_rows = 'MAX__or'
+      out_compute_cols = 'oc'
+      out_compute_rows = 'or'
+      weight_sram_depth = 'MAX__in_channels'
+      stride_str = 'stride'
+    
+    assert conv_input_output_from_DRAM
+    
+    special_case_k1 = int(kernel_dims_str[0]) == 1 and int(kernel_dims_str[1]) == 1
+    assert not special_case_k1
+
+    assert padding == 'SAME'
+    if padding == 'SAME':
+      pad_top, pad_left, pad_bottom, pad_right = get_same_padding(int(data_dims_str[0]),
+        int(data_dims_str[1]), strides, int(kernel_dims_str[0]), int(kernel_dims_str[1]))
+      # Currently no Line Buffers for dw conv because there are no output channels so
+      # partial sums are not stored in large blocks.
+      kr_ignore = '((kr - s)/2).to[Int]' #str( pad_top )
+      kc_ignore = '((kc - s)/2).to[Int]' #str( pad_left )
+      half_kernel_size = int(int(kernel_dims_str[0])/2)
+      
+      if bias_tmpvar_inputs and bias_kernel_dims_str:
+        if make_reuse_def:
+          bias_name = 'bias'
+          bias_dram_name = '{{{REUSE_NAME}}}_bias_concat'
+          bias_sram_dim = 'MAX__in_channels'
+          bias_load_dim = 'bias_start_idx :: bias_start_idx + in_channels'
+        output_string += '''
+        val ''' + bias_name + '''_SRAM = SRAM[T](''' + bias_sram_dim + ''')
+        ''' + bias_name + '''_SRAM load ''' + bias_dram_name + '''_DRAM(''' + bias_load_dim + ''')'''
+      
+      output_string += '''
+        val kr = ''' + kernel_dims_str[0] + '''
+        val kc = ''' + kernel_dims_str[1] + '''
+        val s = ''' + stride_str + '''
+        val kr_ignore = ''' + kr_ignore + '''
+        val kc_ignore = ''' + kc_ignore # Should be (k-s)/2, and same for kr_ignore if no LB
+      
+      if conv_input_output_from_DRAM:
+        output_string += '''
+        Foreach(''' + memreduce_iter + ''' by inB par OP_L''' + str(global_val_number) + ''') { inCh_i => // in channels'''
+      
+      if conv_input_output_from_DRAM:
+        output_string += '''
+        
+          val ''' + out_name + '''_SRAM_conv = SRAM[T](''' + out_sram_rows + ''', ''' + out_sram_cols  + ''', inB)'''
+      
+      # Setting inB = 1 for depthwise, can increase to load larger blocks of channels / input data
+      
+      # Note: Normally for kxk convolution, weights are stored (in channels, out channels * k * k).
+      # But because out channels = 1 for depthwise, might want to move in_channels in with k*k.
+      
+      # Currently inB=1 so loading 1 in channel at a time, but for few in_channels can load all at once,
+      # or can increase inB
+      
+      #output_string += '''
+      #    val ''' + weight_name + '''_SRAM = SRAM[T](inB, kr*kc).hierarchical.noduplicate
+      #    ''' + weight_name + '''_SRAM load ''' + weight_name + '''_DRAM(inCh_i :: inCh_i + inB, 0::kr*kc)
+      #    '''
+
+      if conv_input_output_from_DRAM:# and not weights_small_B_no_reshape:
+        layer_WLP = 1
+        # layer_DLP = 4
+        output_string += '''
+          
+          val ''' + weight_name + '''_SRAM = SRAM[T](inB, kr*kc).hierarchical.noduplicate'''
+        if make_reuse_def:
+          output_string += '''
+          ''' + weight_name + '''_SRAM load ''' + weight_dram_name + \
+          '''_DRAM(weights_start_idx + inCh_i :: weights_start_idx + inCh_i + inB, 0::kr*kc par WLP_L''' + \
+          str(global_val_number) + ''')'''
+        
+        #output_string += '''
+        #  
+        #  val ''' + weight_name + '''_SRAM = SRAM[T](inB*kr*kc).flat.noduplicate'''
+        #if make_reuse_def:
+        #  output_string += '''
+        #  ''' + weight_name + '''_SRAM load ''' + weight_dram_name + '''_DRAM(weights_start_idx, kr*kc*inCh_i.to[Int]::kr*kc*(inCh_i.to[Int]+inB) par WLP_L''' + str(global_val_number) + ''')'''
+        #output_string += '''
+        #  val ''' + weight_name + '''_SRAM_reshape = SRAM[T](inB,kr*kc).hierarchical.noduplicate
+        #  Foreach(kr*kc by 1, inB by 1 par WLP_L''' + str(global_val_number) + '''/2) { (ij, ib) =>
+        #    ''' + weight_name + '''_SRAM_reshape(ib, ij) = ''' + weight_name + '''_SRAM(ib*kr*kc + ij)
+        #  }'''
+    
+      assert int(stride) in [1,2]
+      layer_OP = '{{{REUSE_NAME}}}_OP'
+      output_string += '''
+          val img2D = SRAM[T](''' + img2D_size + ''')'''
+      if make_reuse_def:
+        output_string += '''
+          img2D load tmp_DRAM(load_idx_0, inCh_i*in2D :: inCh_i*in2D + inB*in2D par DLP_L''' + str(global_val_number) + ''')'''
+      c_par = 'IP_L' + str(global_val_number)
+      # weight_read_str = weight_name + '_SRAM_reshape(ib, kc*i.to[Int] + j.to[Int])'
+      weight_read_str = weight_name + '_SRAM(ib, kc*i.to[Int] + j.to[Int])'
+      output_string += generate_sliding_window_depthwise('img2D', out_name, padding, out_compute_rows, out_compute_cols, weight_read_str, \
+        half_kernel_size, c_par)
+
+    if make_reuse_def:
+      dse_string += '  // {{{REUSE_NAME}}}' + "\n"
+    dse_string += '  val WLP_L' + str(global_val_number) + ' = ' + str(layer_WLP) + "\n"
+    if conv_input_output_from_DRAM:
+      dse_string += '  val IP_L' + str(global_val_number) + '  = ' + str(layer_IP) + "\n"
+      dse_string += '  val OP_L' + str(global_val_number) + '  = ' + str(layer_OP) + "\n"
+      dse_string += '  val DLP_L' + str(global_val_number) + ' = ' + str(layer_IP*4) + "\n"
+      dse_string += '  val SP_L' + str(global_val_number) + '  = ' + str(layer_IP) + "\n"
+    dse_string += "\n"
+
+    return output_string, dse_string, weight_blocking, layer_IP
   
   tmpvar = 'tmp' + str(global_val_number)
   name_to_tmpvar[node.name] = tmpvar
@@ -1735,11 +2105,25 @@ while(True):
   else:
     if not reuse:
       accel_function += '        // ' + node.op + "\n"
+  # Final MatMul check: if this is a Conv2D but with 1x1 input, use MatMul here too.
+  # Sometimes instead of using a MatMul for the final layer, a 1x1 Conv is used.
+  # E.g. this is done by MobileNet. In this case, special-case to MatMul. In the 
+  # future, could re-use Conv2D 1x1 here since blocked 1x1 would still be efficient.
+  process_node_as_Conv2D = False
+  process_node_as_MatMul = False
+  if node.op == 'Conv2D':
+    data_dims_str = get_data_dims_str(node, frz_sess)
+    if data_dims_str[0] == '1' and data_dims_str[1] == '1':
+      process_node_as_MatMul = True
+    else:
+      process_node_as_Conv2D = True
+  elif node.op == 'MatMul':
+    process_node_as_MatMul = True
   
   # -----------------------------------------------------
   # Convolution
   # -----------------------------------------------------
-  if node.op == 'Conv2D':
+  if process_node_as_Conv2D:
 
     # Get input and kernel sizes, which are not properties of op but of tensor inputs to op    
     assert len(node.input) == 2      
@@ -1831,7 +2215,6 @@ while(True):
       bias_node = match_nodes[1]
       assert len(bias_node.input) == 2      
       bias_tmpvar_inputs = get_inputs(bias_node, name_to_tmpvar)
-      bias_data_dims_str = get_data_dims_str(bias_node, frz_sess)
       bias_kernel_dims_str = get_kernel_dims_str(bias_node, frz_sess)
       
       # Biases are weights from DRAM
@@ -1847,7 +2230,7 @@ while(True):
       pool_out_height, pool_out_width, pool_out_size, pool_strides, pool_padding = get_output_dim(pool_node, pool_kernel_dims, pool_input_dims, kernel_dims_str[3])
       final_out_size = pool_out_size
 
-      accel_function_out, dse_string_out, weight_blocking = conv_before_fusion(is_input, tmpvar, tmpvar_inputs, bias_tmpvar_inputs, \
+      accel_function_out, dse_string_out, weight_blocking, layer_IP = conv_before_fusion(is_input, tmpvar, tmpvar_inputs, bias_tmpvar_inputs, \
         bias_kernel_dims_str, data_dims_str, kernel_dims_str, strides, padding, out_size.split(','), final_out_size, False)
       accel_function += accel_function_out
       file_opening   += dse_string_out
@@ -1855,7 +2238,7 @@ while(True):
       unique_op_name = 'Fused_Conv2D_BiasAdd_MaxPool_k' + kernel_dims_str[0]
       total_ops = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
       kxk = int(kernel_dims_str[0])*int(kernel_dims_str[1])
-      register_layer_ops(unique_op_name, total_ops, 32, kxk)
+      register_layer_ops(unique_op_name, total_ops, layer_IP, kxk)
       
       # Check if we need to handle edges
       if pool_padding == 'SAME':
@@ -1977,9 +2360,22 @@ while(True):
       bias_node = match_nodes[1]
       assert len(bias_node.input) == 2      
       bias_tmpvar_inputs = get_inputs(bias_node, name_to_tmpvar)
-      bias_data_dims_str = get_data_dims_str(bias_node, frz_sess)
       bias_kernel_dims_str = get_kernel_dims_str(bias_node, frz_sess)
-      if not reuse:
+      
+      # For now, only re-use if no Line Buffer needed
+      # Later can add reuse support for LB as well
+      reuse_supported = False
+      if reuse and not use_line_buffer(data_dims_str):
+        reuse_supported = True
+      # Special case: if this is a 1x1 conv, it is ok to re-use, as long as it is not the first layer
+      # This is because Line Buffer is not actually used for 1x1, so if it is not the first layer (dealing with 3D input)
+      # there is no need for this to deal with 3D at all
+      if reuse and use_line_buffer(data_dims_str):
+        if int(kernel_dims_str[0]) == 1 and int(kernel_dims_str[1]) == 1:
+          if tmpvar_inputs[0][0] != 'i':
+            reuse_supported = True
+      
+      if not reuse_supported:
         # Kernel in DRAM
         weight_mem_declarations_no_reuse += '    val ' + tmpvar_inputs[1] + '_DRAM = DRAM[T](' + ','.join(reformat_memory(kernel_dims_str)) + ')' + "\n"
         weight_mem_declarations_no_reuse += '    setMem(' + tmpvar_inputs[1] + '_DRAM, ' + tmpvar_inputs[1] + get_reshape_string(tmpvar_inputs[1]) + ")\n"
@@ -1987,23 +2383,30 @@ while(True):
         weight_mem_declarations_no_reuse += '    val ' + bias_tmpvar_inputs[1] + '_DRAM = DRAM[T](' + ','.join(reformat_memory(bias_kernel_dims_str)) + ')' + "\n"
         weight_mem_declarations_no_reuse += '    setMem(' + bias_tmpvar_inputs[1] + '_DRAM, ' + bias_tmpvar_inputs[1] + ')' + "\n"
       
-      hw_block, dse_string_out, weight_blocking = conv_before_fusion(is_input, tmpvar, tmpvar_inputs, bias_tmpvar_inputs, bias_kernel_dims_str, data_dims_str, kernel_dims_str, \
-        strides, padding, out_size.split(','), final_out_size, reuse)
+      hw_block, dse_string_out, weight_blocking, layer_IP = conv_before_fusion(is_input, tmpvar, tmpvar_inputs, bias_tmpvar_inputs, bias_kernel_dims_str, data_dims_str, kernel_dims_str, \
+        strides, padding, out_size.split(','), final_out_size, reuse_supported)
 
       # If output is to DRAM
       if conv_input_output_from_DRAM:
-        if reuse:
+        if reuse_supported:
           if use_relu:
             def_arg_values['use_relu: Boolean'] = str('true') # Default is false
           out_name = 'out'
           out_dims = 'MAX__out2D_aligned'
           out_r = 'or'
           out_c = 'oc'
+          bias_sram_name = 'bias'
+          use_relu_name = 'use_relu'
         else:
           out_name = tmpvar
-          out_dims = None#str(burst_align(img2D_size)) # Currently not used
-          out_r = out_dims_str[0]
-          out_c = out_dims_str[1]
+          out_r = out_size.split(',')[0]
+          out_c = out_size.split(',')[1]
+          out_dims = str(burst_align(int(out_r)*int(out_c))) # Currently not used
+          bias_sram_name = bias_tmpvar_inputs[1]
+          if use_relu:
+            use_relu_name = 'true'
+          else:
+            use_relu_name = 'false'
 
         store_block_size = '1'
         # Can check if beneficial to block stores, if so can uncomment this check
@@ -2021,19 +2424,30 @@ while(True):
         bias_load_inside = kernel_dims_str[0] == '1'
         if bias_load_inside:
           hw_block += '''
-              val sum = ''' + out_name + '''_SRAM_conv(r,c,b) + bias_SRAM(b)'''
+              val sum = ''' + out_name + '''_SRAM_conv(r,c,b) + ''' + bias_sram_name + '''_SRAM(b)'''
         else:
           hw_block += '''
-              val sum = ''' + out_name + '''_SRAM_conv(r,c,b) + bias_SRAM(outCh_i.to[Int] + b.to[Int])'''
-        hw_block += '''
-              ''' + out_name + '''_SRAM_bias(r.to[Int]*''' + out_c + ''' + c.to[Int]) = mux( use_relu && (sum < 0.to[T]), 0.to[T], sum )
+              val sum = ''' + out_name + '''_SRAM_conv(r,c,b) + ''' + bias_sram_name + '''_SRAM(outCh_i.to[Int] + b.to[Int])'''
+        if use_relu6:
+          hw_block += '''
+              ''' + out_name + '''_SRAM_bias(r.to[Int]*''' + out_c + ''' + c.to[Int]) = mux( ''' + use_relu_name + ''', min(max(sum, 0.to[T]), 6.to[T]), sum )
             }'''
-        if reuse:
+        else:
+          hw_block += '''
+              ''' + out_name + '''_SRAM_bias(r.to[Int]*''' + out_c + ''' + c.to[Int]) = mux( ''' + use_relu_name + ''' && (sum < 0.to[T]), 0.to[T], sum )
+            }'''
+        if reuse_supported:
           hw_block += '''
             tmp_DRAM(store_idx, (outCh_i.to[Int] + b.to[Int])*out2D :: (outCh_i.to[Int] + b.to[Int] + ''' + store_block_size + ''')*out2D par SP_L''' + str(global_val_number) + ''') store ''' + out_name + '''_SRAM_bias'''
         else:
+          # Can also support reuse for this node, and look up the buffer of tmp_DRAM from the parent.
+          # E.g. create tmp_DRAM_3D for initial layers if LBs are needed and load input into that.
+          # Currently asserting this is the first node.
+          assert not reuse_tmp_dram_ordered
           hw_block += '''
-            ''' + out_name + '''_DRAM(outCh_i.to[Int] + b.to[Int], 0::''' + str(burst_align(out_height*out_width)) + ''' par SP_L''' + str(global_val_number) + ''') store ''' + out_name + '''_SRAM_bias'''
+            tmp_DRAM(0.to[Int], (outCh_i.to[Int] + b.to[Int])*''' + str(burst_align(out_height*out_width)) + ''' :: (outCh_i.to[Int] + b.to[Int])*''' + str(burst_align(out_height*out_width)) + ' + ' + str(burst_align(out_height*out_width)) + ''' par SP_L''' + str(global_val_number) + ''') store ''' + out_name + '''_SRAM_bias'''
+          #hw_block += '''
+          #  ''' + out_name + '''_DRAM(outCh_i.to[Int] + b.to[Int], 0::''' + str(burst_align(out_height*out_width)) + ''' par SP_L''' + str(global_val_number) + ''') store ''' + out_name + '''_SRAM_bias'''
         hw_block += '''
           }
         }'''
@@ -2053,7 +2467,7 @@ while(True):
         }'''
       hw_block += '''
         // Optimization: BiasAdd was merged into Conv2D above'''
-      if reuse or use_relu:
+      if reuse_supported or use_relu:
         hw_block += '''
         // Optimization: ReLU was merged into Conv2D above'''
       hw_block += '''
@@ -2063,24 +2477,29 @@ while(True):
       else:
         name_to_tmpvar[match_nodes[1].name] = tmpvar
 
+      # Note Relu is being omitted because a mux can be used instead
+      large_identifier = ''
+      if use_line_buffer(data_dims_str):
+        large_identifier = '_large'
+      unique_op_name = 'Fused_Conv2D_BiasAdd_k' + kernel_dims_str[1] + large_identifier# + '_s' + strides[1]
+
       # If reuse, check to see whether this is the first occurrence or not
-      if reuse:
-        # Note Relu is being omitted because a mux can be used instead
-        unique_op_name = 'Fused_Conv2D_BiasAdd_k' + kernel_dims_str[1]# + '_s' + strides[1]
+      if reuse_supported:
         hw_block = hw_block.replace('{{{REUSE_NAME}}}', unique_op_name)
         dse_string_out = dse_string_out.replace('{{{REUSE_NAME}}}', unique_op_name)
         register_new_reused_processor(unique_op_name, def_arg_values, hw_block, dse_string_out, \
           True, bias_tmpvar_inputs[1], tmpvar_inputs[1])          
-        total_ops = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
-        kxk = int(kernel_dims_str[0])*int(kernel_dims_str[1])
-        register_layer_ops(unique_op_name, total_ops, 32, kxk)
       else:
         file_opening   += dse_string_out
         accel_function += hw_block
 
+      total_ops = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
+      kxk = int(kernel_dims_str[0])*int(kernel_dims_str[1])
+      register_layer_ops(unique_op_name, total_ops, layer_IP, kxk)
+
     # Otherwise it is unfused convolution
     else:
-      accel_function_out, dse_string_out, weight_blocking = conv_before_fusion(is_input, tmpvar, tmpvar_inputs, None, None, data_dims_str, kernel_dims_str, \
+      accel_function_out, dse_string_out, weight_blocking, layer_IP = conv_before_fusion(is_input, tmpvar, tmpvar_inputs, None, None, data_dims_str, kernel_dims_str, \
         strides, padding, out_size.split(','), final_out_size, False)
       accel_function += accel_function_out
       file_opening   += dse_string_out
@@ -2117,7 +2536,190 @@ while(True):
     name_to_tmpvar[node.name] = tmpvar_inputs[0]
     unpadded_dims [node.name] = get_data_dims_str(node, frz_sess)
     extra_paddings[node.name] = extra_paddings[node.input[1]]
+  
+  # Note: this code is similar to Conv2D above, can merge the 2 code paths
+  elif node.op == 'DepthwiseConv2dNative':
 
+    # Get input and kernel sizes, which are not properties of op but of tensor inputs to op    
+    assert len(node.input) == 2      
+    data_dims_str = get_data_dims_str(node, frz_sess)
+    kernel_dims_str = get_kernel_dims_str(node, frz_sess)
+    
+    # Now that we have dimensions, also get padding and stride
+    out_height, out_width, out_size, strides, padding = get_output_dim(node, kernel_dims_str, data_dims_str, kernel_dims_str[3])
+    final_out_size = out_size
+    
+    # If these asserts fail, copy the relevant code from Conv2D above
+    assert node.input[0] not in extra_paddings.keys()
+    assert not tmpvar_inputs[0][0] == 'i'
+    assert conv_input_output_from_DRAM
+    assert reuse
+    
+    if reuse:
+      in2D_size = int(data_dims_str[0])*int(data_dims_str[1])
+      def_arg_values = {}
+      def_arg_values['nr: Int'              ] = data_dims_str[0]
+      def_arg_values['nc: Int'              ] = data_dims_str[1]
+      def_arg_values['or: Int'              ] = str(out_height)
+      def_arg_values['oc: Int'              ] = str(out_height)
+      def_arg_values['in_channels: Int'     ] = kernel_dims_str[2]
+      def_arg_values['stride: Int'          ] = strides[1]
+      def_arg_values['bias_start_idx : Int'  ] = None # Gets updated later
+      def_arg_values['weights_start_idx : Int'  ] = None # Gets updated later
+      def_arg_values['store_idx : Int'        ] = None # Gets updated later
+      def_arg_values['load_idx_0 : Int'         ] = None # Gets updated later
+      def_arg_values['MAX__or: Int'          ] = data_dims_str[0]
+      def_arg_values['MAX__oc: Int'          ] = data_dims_str[1]
+      def_arg_values['in2D: Int'        ] = str(in2D_size)
+      def_arg_values['MAX__in2D_aligned: Int'   ] = str(burst_align(in2D_size))
+      def_arg_values['out2D: Int'       ] = str((out_height*out_width))
+      def_arg_values['MAX__out2D_aligned: Int'  ] = str(burst_align(out_height*out_width))
+      def_arg_values['MAX__in_channels: Int' ] = kernel_dims_str[2]
+      def_arg_values['use_relu: Boolean'    ] = str('false') # Gets updated later
+            
+      # Calculate in buffer size
+      # Because there are no out channels and therefore no block of partial sums, load
+      # the entire 2D feature map. If this ends up using too much memory, can use line
+      # buffer like in Conv2D.
+      if not max_depthwise_conv_input:
+        for node in output_graph_def.node:
+          if node.op == 'DepthwiseConv2dNative':
+            input_dims = get_data_dims_str(node, frz_sess)
+            input_2D_size = int(input_dims[0])*int(input_dims[1])
+            max_depthwise_conv_input = max(max_depthwise_conv_input, input_2D_size)
+      
+      # Currently making block size 1, can increase later based on above
+      inChannel_block_size = 1
+      #if block_input_channels(kernel_dims_str):
+      #  inChannel_block_size = closest_pow_2(device_params['image_buffer_size'] / in2D_size)
+      def_arg_values['inB : Int'            ] = str(inChannel_block_size)
+    
+    # Fusion
+    match_nodes1 = fusion_optimization_match(['DepthwiseConv2dNative', 'BiasAdd', 'Relu'], output_graph_def.node, node_idx-1)
+    match_nodes2 = fusion_optimization_match(['DepthwiseConv2dNative', 'BiasAdd'], output_graph_def.node, node_idx-1)
+    
+    # ['DepthwiseConv2dNative', 'BiasAdd', 'Relu'],
+    # ['DepthwiseConv2dNative', 'BiasAdd']
+    # Implement both here since only difference is a mux
+    if match_nodes1 or match_nodes2:
+    
+      if match_nodes1:
+        use_relu = True
+        match_nodes = match_nodes1
+      else:
+        use_relu = False
+        match_nodes = match_nodes2
+        
+      for node in match_nodes:
+        nodes_already_processed_through_fusion.add(node.name)
+       
+      # Get bias add parameters
+      bias_node = match_nodes[1]
+      assert len(bias_node.input) == 2      
+      bias_tmpvar_inputs = get_inputs(bias_node, name_to_tmpvar)
+      bias_kernel_dims_str = get_kernel_dims_str(bias_node, frz_sess)
+      
+      reuse_supported = True
+      
+      hw_block, dse_string_out, weight_blocking, layer_IP = conv_before_fusion_depthwise(is_input, tmpvar, tmpvar_inputs, bias_tmpvar_inputs, bias_kernel_dims_str, data_dims_str, kernel_dims_str, \
+        strides, padding, out_size.split(','), final_out_size, reuse_supported)
+      
+      if conv_input_output_from_DRAM:
+        if reuse_supported:
+          if use_relu:
+            def_arg_values['use_relu: Boolean'] = str('true') # Default is false
+          out_name = 'out'
+          out_dims = 'MAX__out2D_aligned'
+          out_r = 'or'
+          out_c = 'oc'
+
+        store_block_size = '1'
+        # Can check if beneficial to block stores, if so can uncomment this check
+        # and then also add 1 more loop iterator below for when this is true 
+        #if block_input_channels(kernel_dims_str):
+        #  store_block_size = 'ofmap_block_store_size'
+
+        # The par here should be > the store par below and also match the par of the conv above.
+        # E.g. instead of 8, the lowest common dimension (e.g. 7) may work better.
+        hw_block += '''
+          // Fused BiasAdd
+          Foreach(inB by ''' + store_block_size + ''') { ib =>
+            val ''' + out_name + '''_SRAM_bias = SRAM[T](''' + out_dims + ''')
+            Foreach(0 until ''' + out_r + ''', 0 until ''' + out_c + ''' par SP_L''' + str(global_val_number) + ''') { (r,c) =>'''
+        bias_load_inside = kernel_dims_str[0] == '1'
+        if bias_load_inside:
+          hw_block += '''
+              val sum = ''' + out_name + '''_SRAM_conv(r,c,ib) + bias_SRAM(ib)'''
+        else:
+          hw_block += '''
+              val sum = ''' + out_name + '''_SRAM_conv(r,c,ib) + bias_SRAM(inCh_i.to[Int] + ib.to[Int])'''
+        if use_relu6:
+          hw_block += '''
+              ''' + out_name + '''_SRAM_bias(r.to[Int]*''' + out_c + ''' + c.to[Int]) = mux( use_relu, min(max(sum, 0.to[T]), 6.to[T]), sum )
+            }'''
+        else:
+          hw_block += '''
+              ''' + out_name + '''_SRAM_bias(r.to[Int]*''' + out_c + ''' + c.to[Int]) = mux( use_relu && (sum < 0.to[T]), 0.to[T], sum )
+            }'''
+        if reuse_supported:
+          hw_block += '''
+            tmp_DRAM(store_idx, (inCh_i.to[Int] + ib.to[Int])*out2D :: (inCh_i.to[Int] + ib.to[Int] + ''' + store_block_size + ''')*out2D par SP_L''' + str(global_val_number) + ''') store ''' + out_name + '''_SRAM_bias'''
+        hw_block += '''
+          }'''
+      hw_block += '''
+          // Optimization: BiasAdd was merged into Conv2D above'''
+      if reuse_supported or use_relu:
+        hw_block += '''
+          // Optimization: ReLU was merged into Conv2D above'''
+      hw_block += '''
+        }
+'''
+      if use_relu:
+        name_to_tmpvar[match_nodes[2].name] = tmpvar
+      else:
+        name_to_tmpvar[match_nodes[1].name] = tmpvar
+      
+      # If reuse, check to see whether this is the first occurrence or not
+      if reuse_supported:
+        # Note Relu is being omitted because a mux can be used instead
+        large_identifier = ''
+        #if use_line_buffer(data_dims_str):
+        #  large_identifier = '_large'
+        unique_op_name = 'Fused_DepthwiseConv_BiasAdd_k' + kernel_dims_str[1] + large_identifier# + '_s' + strides[1]
+        hw_block = hw_block.replace('{{{REUSE_NAME}}}', unique_op_name)
+        dse_string_out = dse_string_out.replace('{{{REUSE_NAME}}}', unique_op_name)
+        register_new_reused_processor(unique_op_name, def_arg_values, hw_block, dse_string_out, \
+          True, bias_tmpvar_inputs[1], tmpvar_inputs[1])          
+        total_ops = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
+        kxk = int(kernel_dims_str[0])*int(kernel_dims_str[1])
+        register_layer_ops(unique_op_name, total_ops, layer_IP, kxk)
+
+    # Otherwise it is unfused convolution
+    else:
+      accel_function_out, dse_string_out, weight_blocking, layer_IP = conv_before_fusion_depthwise(is_input, tmpvar, tmpvar_inputs, None, None, data_dims_str, kernel_dims_str, \
+        strides, padding, out_size.split(','), final_out_size, False)
+      accel_function += accel_function_out
+      file_opening   += dse_string_out
+      # If output is to DRAM
+      if conv_input_output_from_DRAM:
+        accel_function += '''
+            ''' + tmpvar + '''_DRAM(inCh_i, 0::''' + str(out_height) + ''', 0::''' + str(burst_align(out_width)) + ''') store ''' + tmpvar + '''_SRAM_conv
+          }
+        }'''
+    # If output is to DRAM, declare it here using final_out_size
+    if conv_input_output_from_DRAM:
+      out_size_align_last = reformat_memory(final_out_size.split(','))
+      out_size_align_last[-1] = str(burst_align(int(out_size_align_last[-1])))
+      if reuse:
+        reuse_tmp_dram_ordered.append(tmpvar)
+        reuse_tmp_dram_dims[tmpvar] = out_size_align_last
+        if tmpvar_inputs[0] not in reuse_tmp_dram_children.keys():
+          reuse_tmp_dram_children[tmpvar_inputs[0]] = []
+        reuse_tmp_dram_children[tmpvar_inputs[0]].append(tmpvar)
+        reuse_tmp_dram_parents[tmpvar] = [tmpvar_inputs[0]]
+      else:
+        tmp_mem_declarations_no_reuse += '    val ' + tmpvar           + '_DRAM = DRAM[T](' + ','.join(out_size_align_last) + ')' + "\n\n"
+  
   # -----------------------------------------------------
   # Reshape
   # -----------------------------------------------------
@@ -2173,7 +2775,7 @@ while(True):
   # -----------------------------------------------------
   # Mean
   # -----------------------------------------------------
-  elif node.op == 'Mean':
+  elif node.op in ['Mean', 'AvgPool']:
   
     data_dims_str = get_data_dims_str(node, frz_sess)
     rc_unaligned = str(int(data_dims_str[0]) * int(data_dims_str[0]))
@@ -2306,7 +2908,7 @@ while(True):
   # -----------------------------------------------------
   # MatMul
   # -----------------------------------------------------
-  elif node.op == 'MatMul':
+  elif process_node_as_MatMul:
     
     # If reuse_FC is true, these will be called in a loop. Because input is in SRAM, it will
     # not make a def like reuse with DRAM.
@@ -2315,6 +2917,14 @@ while(True):
     assert len(node.input) == 2
     kernel_dims_str = get_kernel_dims_str(node, frz_sess)    
     data_dims_str = get_data_dims_str(node, frz_sess)
+    
+    # This might be a convolution with input 1x1, if so make it a MatMul here
+    conv_as_matmul = False
+    if node.op == 'Conv2D':
+      assert data_dims_str[0] == '1' and data_dims_str[1] == '1'
+      assert not reuse_FC # Can handle this case later
+      conv_as_matmul = True
+      node.op = 'MatMul'
     
     if not reuse_FC:
       weight_mem_declarations_no_reuse += '    val ' + tmpvar_inputs[1] + '_DRAM = DRAM[T](' + ','.join(reformat_memory(kernel_dims_str)) + ')' + "\n"
@@ -2356,6 +2966,11 @@ while(True):
     bias_tmpvar_inputs = get_inputs(bias_node, name_to_tmpvar)
     bias_data_dims_str = get_data_dims_str(bias_node, frz_sess)
     bias_kernel_dims_str = get_kernel_dims_str(bias_node, frz_sess)
+    # If Conv2D, remove dimensions of size 1
+    if conv_as_matmul:
+      data_dims_str = kernel_dims_str[2:]
+      kernel_dims_str = kernel_dims_str[2:]
+      bias_data_dims_str = [bias_data_dims_str[-1]]
     assert len(bias_data_dims_str) == 1
     assert len(bias_kernel_dims_str) == 1
     assert bias_data_dims_str[0] == bias_kernel_dims_str[0]
@@ -2746,27 +3361,33 @@ for layer in reuse_weight_dram.keys():
       for inner_dim in inner_dims_sorted:
         if inner_dim == max_inner_dim:
           last_iter = True
-        if first_iter:
+        if first_iter and last_iter:
+          weight_mem_declarations += ''
+        elif first_iter:
           weight_mem_declarations += '      if'
-          first_iter = False
         elif last_iter:
           weight_mem_declarations += ' else '
         else:
           weight_mem_declarations += ' else if'
         
-        if last_iter:
-          weight_mem_declarations += ''' {
+        if first_iter and last_iter:
+          weight_mem_declarations += '''
           ''' + layer + '_' + dram + '_' + str(inner_dim) + '_concat' + '''(i-(''' + str(sum_outer_dims) + '''), j)'''
+        elif last_iter:
+          weight_mem_declarations += ''' {
+          ''' + layer + '_' + dram + '_' + str(inner_dim) + '_concat' + '''(i-(''' + str(sum_outer_dims) + '''), j)
+      }'''
         else:
           weight_mem_declarations += ''' (i < ''' + str(sum_outer_dims + file_sizes[str(inner_dim)]) + ''') {
         if (j < ''' + str(inner_dim) + ''') {
           ''' + layer + '_' + dram + '_' + str(inner_dim) + '_concat' + '''(i-(''' + str(sum_outer_dims) + '''), j)
         } else {
           0.to[T]
-        }'''
-        weight_mem_declarations += '''
+        }
       }'''
         sum_outer_dims += file_sizes[str(inner_dim)]
+        if first_iter:
+          first_iter = False
       weight_mem_declarations += '''
     }
     setMem(''' + array_name + '''_DRAM, ''' + array_name + '''_host)
@@ -2783,12 +3404,31 @@ for layer in reuse_weight_dram.keys():
         if dims[1] not in inner_dims:
           inner_dims.append(dims[1])
         if dims[0] not in outer_dims:
-          outer_dims.append(dims[1])
+          outer_dims.append(dims[0])
         kernel_size = dims[2]
+      
+      # We also need to map the number of in channels to the number of out channels.
+      in_to_out_map = {}
+      for const in reuse_weight_dram[layer][dram]:
+        dims = tmpvar_to_reshape_string[const].split(',')
+        inner_dim = dims[1]
+        outer_dim = dims[0]
+        if inner_dim not in in_to_out_map.keys():
+          in_to_out_map[inner_dim] = outer_dim
+        elif in_to_out_map[inner_dim] != outer_dim:
+          # In this case, rather than a constant number of out channels for a given number
+          # of in channels, it will vary. This means the reshaping on the host needs to keep
+          # track of the number of out channels per weight tensor. All this information exists
+          # in the current script, but not in the generated scala host. So instead of reshaping
+          # there, the reshape would happen here.
+          utils.error_exit('Mismatching in/out channels is currently unsupported for k>1, but not hard to add. Please contact the code author.')
       
       inner_dim_to_cumulative_outer_dims = {}
       for inner_dim in inner_dims:
         inner_dim_to_cumulative_outer_dims[inner_dim] = 0
+      inner_dim_to_cumulative_inner_dims = {}
+      for inner_dim in inner_dims:
+        inner_dim_to_cumulative_inner_dims[inner_dim] = 0
       outer_dim_to_cumulative_inner_dims = {}
       for outer_dim in outer_dims:
         outer_dim_to_cumulative_inner_dims[outer_dim] = 0
@@ -2808,6 +3448,7 @@ for layer in reuse_weight_dram.keys():
         outer_dim = dims[0]
         inner_dim = dims[1]
         inner_dim_to_cumulative_outer_dims[inner_dim] += int(outer_dim)
+        inner_dim_to_cumulative_inner_dims[inner_dim] += int(inner_dim)
         outer_dim_to_cumulative_inner_dims[outer_dim] += int(inner_dim)
         import numpy as np
         # Default storage is [k, k, inCh, outCh], so invert this (transpose) to [outCh, inCh, k, k]
@@ -2825,12 +3466,16 @@ for layer in reuse_weight_dram.keys():
         const_files[inner_dim].close()
       
       outer_dims_sorted = sorted(map(int, outer_dims))
+      inner_dims_sorted = sorted(map(int, inner_dims))
       
       # Now concat these weights into a single, larger array, and then generate the LUT arg offsets
       # Also get the max outer dim and sum of inner dims
       start_idx_list = []
       outer_dim_to_running_total = {}
       sum_inner_dims = 0
+      max_inner_dim  = 0
+      for inner_dim in inner_dims_sorted:
+        max_inner_dim = max(max_inner_dim, inner_dim)
       max_outer_dim  = 0
       for outer_dim in outer_dims_sorted:
         outer_dim_to_running_total[str(outer_dim)] = sum_inner_dims
@@ -2841,7 +3486,7 @@ for layer in reuse_weight_dram.keys():
         outer_dim = dims[0]
         start_idx_list.append(str(outer_dim_to_running_total[outer_dim]))
         outer_dim_to_running_total[outer_dim] += int(dims[1])
-      reuse_args[layer][dram + '_start_idx : Int'] = start_idx_list
+      reuse_args[layer][dram + '_start_idx : Int'] = start_idx_list      
       
       array_name = layer + '_' + dram + '_concat'
       weight_mem_declarations += '''    val ''' + array_name + '''_DRAM = DRAM[T](''' + str(sum_inner_dims) + ''',''' + str(max_outer_dim) + '*' + kernel_size + ''')
@@ -2850,38 +3495,50 @@ for layer in reuse_weight_dram.keys():
       first_iter = True
       last_iter = False
       sum_inner_dims = 0
-      for outer_dim in outer_dims_sorted:
-        if outer_dim == max_outer_dim:
+      for inner_dim in inner_dims_sorted:
+        if inner_dim == max_inner_dim:
           last_iter = True
-        if first_iter:
+        if first_iter and last_iter:
+          weight_mem_declarations += ''
+        elif first_iter:
           weight_mem_declarations += '      if'
-          first_iter = False
         elif last_iter:
           weight_mem_declarations += ' else '
         else:
           weight_mem_declarations += ' else if'
         
-        if last_iter:
+        if first_iter and last_iter:
+          weight_mem_declarations += '''
+        val i_range = i-(''' + str(sum_inner_dims) + ''')
+        val in_channel = i_range%''' + str(inner_dim) + '''
+        val out_channel = j/(''' + kernel_size + ''') + (i_range/''' + str(inner_dim) + ''')*''' + in_to_out_map[str(inner_dim)] + '''
+        val kernel = j%(''' + kernel_size + ''')
+        ''' + layer + '_' + dram + '_' + str(inner_dim) + '_concat' + '''(out_channel, in_channel, kernel)'''
+          # if/else 0 can be added here too, but not necessary
+        elif last_iter:
           weight_mem_declarations += ''' {
         val i_range = i-(''' + str(sum_inner_dims) + ''')
-        val in_channel = i_range%''' + str(outer_dim) + '''
-        val out_channel = j/(''' + kernel_size + ''') + (i_range/''' + str(outer_dim) + ''')*''' + str(outer_dim) + '''
+        val in_channel = i_range%''' + str(inner_dim) + '''
+        val out_channel = j/(''' + kernel_size + ''') + (i_range/''' + str(inner_dim) + ''')*''' + in_to_out_map[str(inner_dim)] + '''
         val kernel = j%(''' + kernel_size + ''')
-        ''' + layer + '_' + dram + '_' + str(outer_dim) + '_concat' + '''(out_channel, in_channel, kernel)'''
+        ''' + layer + '_' + dram + '_' + str(inner_dim) + '_concat' + '''(out_channel, in_channel, kernel)
+      }'''
+          # if/else 0 can be added here too, but not necessary
         else:
-          weight_mem_declarations += ''' (i < ''' + str(sum_inner_dims + outer_dim_to_cumulative_inner_dims[str(outer_dim)]) + ''') {
+          weight_mem_declarations += ''' (i < ''' + str(sum_inner_dims + inner_dim_to_cumulative_inner_dims[str(inner_dim)]) + ''') {
         val i_range = i-(''' + str(sum_inner_dims) + ''')
-        val in_channel = i_range%''' + str(outer_dim) + '''
-        val out_channel = j/(''' + kernel_size + ''') + (i_range/''' + str(outer_dim) + ''')*''' + str(outer_dim) + '''
+        val in_channel = i_range%''' + str(inner_dim) + '''
+        val out_channel = j/(''' + kernel_size + ''') + (i_range/''' + str(inner_dim) + ''')*''' + in_to_out_map[str(inner_dim)] + '''
         val kernel = j%(''' + kernel_size + ''')
-        if (j/(''' + kernel_size + ''') < ''' + str(outer_dim) + ''') {
-          ''' + layer + '_' + dram + '_' + str(outer_dim) + '_concat' + '''(out_channel, in_channel, kernel)
+        if (j/(''' + kernel_size + ''') < ''' + str(in_to_out_map[str(inner_dim)]) + ''') {
+          ''' + layer + '_' + dram + '_' + str(inner_dim) + '_concat' + '''(out_channel, in_channel, kernel)
         } else {
           0.to[T]
-        }'''
-        weight_mem_declarations += '''
+        }
       }'''
-        sum_inner_dims += outer_dim_to_cumulative_inner_dims[str(outer_dim)]
+        sum_inner_dims += inner_dim_to_cumulative_inner_dims[str(inner_dim)]
+        if first_iter:
+          first_iter = False
       weight_mem_declarations += '''
     }
     setMem(''' + array_name + '''_DRAM, ''' + array_name + '''_host)
@@ -3169,6 +3826,20 @@ if reuse and reuse_layer_list:  # If there is at least one reused processor
 '''
   accel_function = accel_function.replace('{{{INSERT_REUSE_LOOP_HERE}}}', reuse_loop)
 
+  # If store_idx LUT was optimized away, replace accesses to it with the corresponding constants
+  store_arg = 'store_idx : Int'
+  if (store_arg not in arg_map_combined.keys()) or (store_arg in args_used_by_one_layer.keys()):
+    store_LUT = [0]*num_layers
+    for layer in reuse_layer_list_unique:
+      if store_arg in reuse_args[layer].keys():
+        for idx, value in enumerate(reuse_args[layer][store_arg]):
+          state = int(reuse_schedule[layer][idx])
+          store_LUT[state] = reuse_args[layer][store_arg][idx]
+    for lut_idx in range(num_layers):
+      match_string = 'store_idx_args(' + str(lut_idx) + ')'
+      if match_string in accel_function:
+        new_store_idx = str(store_LUT[lut_idx]) + '.to[Int]'
+        accel_function = accel_function.replace(match_string, new_store_idx)
 
 # ========================================================================================================
 # Static Model for DSP Assignment
@@ -3190,7 +3861,10 @@ if reuse_layer_to_ops.keys():
     percent_for_op = float(reuse_layer_to_ops[layer])/float(total_ops)
     print '  ' + layer + spaces + str(100.*percent_for_op)[0:5] + '%  (' + str(reuse_layer_to_ops[layer]) + ' / ' + str(total_ops) + ')'
     if layer in reuse_layer_to_IP.keys() and layer in reuse_layer_to_kxk.keys():
-      par_alloc = str(closest_pow_2(mults_to_assign * percent_for_op / reuse_layer_to_IP[layer] / reuse_layer_to_kxk[layer]))
+      # Spatial currently has JVM code size errors for large outer pars. The line below should be used here:
+      # par_alloc = str(closest_pow_2(mults_to_assign * percent_for_op / reuse_layer_to_IP[layer] / reuse_layer_to_kxk[layer]))
+      # But until that is fixed, limiting the outer par to 8 here:
+      par_alloc = str(min(8, closest_pow_2(mults_to_assign * percent_for_op / reuse_layer_to_IP[layer] / reuse_layer_to_kxk[layer])))
       file_opening = file_opening.replace(layer + '_OP', par_alloc)
   print
   
@@ -3277,7 +3951,10 @@ f.close()
 print 'Output written to ' + output_fname
 print 'Compile and synthesize in Spatial by placing this file in spatial/test/spatial/tests/apps/'
 print 'and running the following command in the spatial-dnn directory:'
-print '  $ bin/spatial ' + app_name + ' --synth --forceFuseFMA --noBindParallels --fpga=AWS_F1 && cd gen/' + app_name + ' && make aws-F1'
+if use_relu6:
+  print '  $ bin/spatial ' + app_name + ' --synth --noBindParallels --fpga=AWS_F1 && cd gen/' + app_name + ' && make aws-F1'
+else:
+  print '  $ bin/spatial ' + app_name + ' --synth --forceFuseFMA --noBindParallels --fpga=AWS_F1 && cd gen/' + app_name + ' && make aws-F1'
 print 
 print 'The format for inputs is currently .csv. E.g. to convert an image file to .csv, use data/img_to_csv.py'
 
