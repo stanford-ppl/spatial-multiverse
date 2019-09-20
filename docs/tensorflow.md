@@ -14,6 +14,7 @@
 The following operations are supported at the DNN graph level:
 
 * Convolutions of different strides/paddings/kernel sizes
+* Depthwise convolutions
 * Poolings (e.g. max, average)
 * Nonlinearities (e.g. ReLU, Sigmoid)
 * Element-wise (e.g. Tensor Addition)

@@ -676,7 +676,7 @@ while(True):
     if node.op == 'Softmax':
       processed_softmax = True
     continue
-  # Or force user to pick output as Softmax or before
+  # Alternatively, could require the user to specify the output as the Softmax or something before
   if processed_softmax:
     continue
 
@@ -2088,7 +2088,7 @@ while(True):
       dse_string += '  val IP_L' + str(global_val_number) + '  = ' + str(layer_IP) + "\n"
       dse_string += '  val OP_L' + str(global_val_number) + '  = ' + str(layer_OP) + "\n"
       dse_string += '  val DLP_L' + str(global_val_number) + ' = ' + str(layer_IP*4) + "\n"
-      dse_string += '  val SP_L' + str(global_val_number) + '  = ' + str(layer_IP) + "\n"
+      dse_string += '  val SP_L' + str(global_val_number) + '  = ' + str(layer_IP*4) + "\n"
     dse_string += "\n"
 
     return output_string, dse_string, weight_blocking, layer_IP
@@ -2589,6 +2589,7 @@ while(True):
             max_depthwise_conv_input = max(max_depthwise_conv_input, input_2D_size)
       
       # Currently making block size 1, can increase later based on above
+      # Also change bias loop below since assumes 1 now
       inChannel_block_size = 1
       #if block_input_channels(kernel_dims_str):
       #  inChannel_block_size = closest_pow_2(device_params['image_buffer_size'] / in2D_size)
@@ -2643,16 +2644,17 @@ while(True):
         # E.g. instead of 8, the lowest common dimension (e.g. 7) may work better.
         hw_block += '''
           // Fused BiasAdd
-          Foreach(inB by ''' + store_block_size + ''') { ib =>
+          // Note: For now inB=1 so remove this loop
+          // Foreach(inB by ''' + store_block_size + ''') { ib =>
             val ''' + out_name + '''_SRAM_bias = SRAM[T](''' + out_dims + ''')
-            Foreach(0 until ''' + out_r + ''', 0 until ''' + out_c + ''' par SP_L''' + str(global_val_number) + ''') { (r,c) =>'''
+            Foreach(0 until ''' + out_r + ''', 0 until ''' + out_c + ''' par 1/*SP_L''' + str(global_val_number) + '''*/) { (r,c) =>'''
         bias_load_inside = kernel_dims_str[0] == '1'
         if bias_load_inside:
           hw_block += '''
-              val sum = ''' + out_name + '''_SRAM_conv(r,c,ib) + bias_SRAM(ib)'''
+              val sum = ''' + out_name + '''_SRAM_conv(r,c,0.to[Int]/*ib*/) + bias_SRAM(0.to[Int]/*ib*/)'''
         else:
           hw_block += '''
-              val sum = ''' + out_name + '''_SRAM_conv(r,c,ib) + bias_SRAM(inCh_i.to[Int] + ib.to[Int])'''
+              val sum = ''' + out_name + '''_SRAM_conv(r,c,0.to[Int]/*ib*/) + bias_SRAM(inCh_i.to[Int]/* + ib.to[Int]*/)'''
         if use_relu6:
           hw_block += '''
               ''' + out_name + '''_SRAM_bias(r.to[Int]*''' + out_c + ''' + c.to[Int]) = mux( use_relu, min(max(sum, 0.to[T]), 6.to[T]), sum )
@@ -2663,9 +2665,9 @@ while(True):
             }'''
         if reuse_supported:
           hw_block += '''
-            tmp_DRAM(store_idx, (inCh_i.to[Int] + ib.to[Int])*out2D :: (inCh_i.to[Int] + ib.to[Int] + ''' + store_block_size + ''')*out2D par SP_L''' + str(global_val_number) + ''') store ''' + out_name + '''_SRAM_bias'''
+            tmp_DRAM(store_idx, (inCh_i.to[Int]/* + ib.to[Int]*/)*out2D :: (inCh_i.to[Int] + /*ib.to[Int] +*/ ''' + store_block_size + ''')*out2D par SP_L''' + str(global_val_number) + ''') store ''' + out_name + '''_SRAM_bias'''
         hw_block += '''
-          }'''
+          // }'''
       hw_block += '''
           // Optimization: BiasAdd was merged into Conv2D above'''
       if reuse_supported or use_relu:

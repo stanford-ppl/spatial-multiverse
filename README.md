@@ -25,3 +25,17 @@ Click on the documentation links below to get started:
 * [AWS F1 Instructions](docs/aws.md)
 * [End-to-end Demo](docs/demo.md)
 * [Overview of TensorFlow Support](docs/tensorflow.md)
+
+
+## Citation
+
+If you find the TensorFlow to Spatial compiler useful for your work, you can cite our FPL paper, e.g. as follows:
+```
+@inproceedings{hadjis19fpl,
+  author = {S. Hadjis and K. Olukotun},
+  title =  {TensorFlow to Cloud {FPGAs}: Tradeoffs for Accelerating Deep Neural Networks},
+  year = {2019},
+  booktitle = {Field Programmable Logic and Applications (FPL19)},
+  publisher = {IEEE}
+}
+```

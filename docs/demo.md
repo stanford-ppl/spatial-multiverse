@@ -1,4 +1,4 @@
-# End-to-end Demonstration
+# TensorFlow to Cloud FPGAs: End-to-end Demo
 
 ## Contents
 
