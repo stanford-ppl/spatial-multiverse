@@ -6,17 +6,13 @@ This example contains the newer implementation of ResNet released by the [Tensor
 bash get_resnet_official.sh
 ```
 
-2. Then run the following commands from the root directory:
+2. Then run the following three commands from the root directory. Note: You may also want to print ImageNet classification, if so see the instructions [here](../../docs/demo.md) before running the third command.
 
 ```
 python create_inference_graph.py saved_model models/resnet_official/resnet_v1_fp32_savedmodel_NHWC/1538686669 softmax_tensor  models/resnet_official/ resnet_official
 
 python  optimize_inference_graph.py  models/resnet_official/resnet_official.pb  input_tensor  softmax_tensor  224,224,3
-```
 
-You may also want to print ImageNet classification, if so see the instructions [here](../../docs/demo.md) before running the final step.
-
-```
 python dnn_to_spatial.py models/resnet_official/resnet_official_opt2.pb
 ```
 
