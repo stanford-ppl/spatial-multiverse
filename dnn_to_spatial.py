@@ -1381,7 +1381,7 @@ while(True):
       if use_line_buffer(data_dims_str):
         layer_DLP = 4
         layer_WLP = 2 # Can make this 1, and then instead of layer_WLP/2 below, do max(1, layer_WLP/2)
-        layer_SP = 1
+        layer_SP = 4
       else:
         layer_DLP = 16
         layer_WLP = 8

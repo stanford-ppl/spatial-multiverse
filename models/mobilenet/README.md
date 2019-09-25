@@ -15,7 +15,7 @@ bash get_mobilenet.sh
 python  optimize_inference_graph.py  models/mobilenet/mobilenet_v1_1.0_224_frozen.pb  input  MobilenetV1/Predictions/Reshape_1  224,224,3
 ```
 
-Note: you can have also used the output before the SoftMax rather than the output listed in the TensorFlow archive (result is the same), e.g.:
+Note: you could have also used the output before the SoftMax rather than the output listed in the TensorFlow archive (result is the same), e.g.:
 
 ```
 python  optimize_inference_graph.py  models/mobilenet/mobilenet_v1_1.0_224_frozen.pb  input  MobilenetV1/Logits/Conv2d_1c_1x1/BiasAdd  224,224,3

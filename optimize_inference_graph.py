@@ -17,8 +17,6 @@
 import utils
 import os
 import tensorflow as tf
-from tensorflow.python.saved_model import tag_constants
-from tensorflow.python.tools import freeze_graph
 from tensorflow.python import ops
 from tensorflow.tools.graph_transforms import TransformGraph
 

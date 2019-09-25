@@ -24,7 +24,6 @@ export _JAVA_OPTIONS="-Xms1024m -Xss256m -Xmx16g -XX:MaxMetaspaceSize=16g"
 sudo pip install tensorflow==1.14.0
 ```
 
-Any recent build should work, but we originally built and tested using version 1.12.0 and Python 2.7.6.
-When later adding MobileNet support, we had moved to version 1.14.0.
+We tested using version 1.14.0 and Python 2.7.6.
 
 3. If you want to run on the Amazon F1, you will need to set up [aws-fpga](https://github.com/aws/aws-fpga). Modify your `.bashrc` to set `AWS_HOME` and to source `hdk_setup.sh` and `sdk_setup.sh`. For more details you can read the AWS tutorial [here](aws.md).

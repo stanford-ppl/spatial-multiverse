@@ -10,7 +10,7 @@
 
 ## Introduction
 
-This shows some end-to-end tutorials. We will look at 2 CNNs:
+This shows some end-to-end tutorials for running TensorFlow on the Amazon F1. We will look at 2 CNNs:
 
 * LeNet
 * ResNet-50 (two versions: Original Publication and Official TensorFlow)
@@ -34,7 +34,7 @@ Note these instructions are also provided in the example's [README](../models/re
 First, create the unoptimized inference graph:
 
 ```
-python create_inference_graph.py saved_model models/resnet/resnet_v1_fp32_savedmodel_NHWC/1538686669 softmax_tensor  models/resnet_official/ resnet_official
+python create_inference_graph.py saved_model models/resnet_official/resnet_v1_fp32_savedmodel_NHWC/1538686669 softmax_tensor  models/resnet_official/ resnet_official
 ```
 
 Next, optimize it using TensorFlow's graph utilities:
