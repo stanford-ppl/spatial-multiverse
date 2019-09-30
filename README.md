@@ -35,7 +35,7 @@ If you find the TensorFlow to Spatial compiler useful for your work, you can cit
   author = {S. Hadjis and K. Olukotun},
   title =  {TensorFlow to Cloud {FPGAs}: Tradeoffs for Accelerating Deep Neural Networks},
   year = {2019},
-  booktitle = {Field Programmable Logic and Applications (FPL19)},
+  booktitle = {Field Programmable Logic and Applications (FPL2019)},
   publisher = {IEEE}
 }
 ```

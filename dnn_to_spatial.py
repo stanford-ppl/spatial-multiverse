@@ -86,7 +86,7 @@ reuse_tmp_dram_ordered = []
 reuse_tmp_dram_children = {}
 reuse_tmp_dram_parents = {}
 reuse_layer_list = []
-reuse_layer_to_ops = {}
+reuse_layer_to_macs = {}
 reuse_layer_to_IP = {}
 reuse_layer_to_kxk = {}
 reuse_FC_name = ''
@@ -94,6 +94,7 @@ include_sigmoid_initialization = False
 fc_section = False
 max_depthwise_conv_input = None
 processed_softmax = False
+use_constraint_solver = False
 
 
 # ========================================================================================================
@@ -853,15 +854,15 @@ while(True):
     reuse_layer_list.append(op_name)
   
   # Register a new layer for static model
-  def register_layer_ops(op_name, total_ops, ip, kxk):
+  def register_layer_ops(op_name, total_macs, ip, kxk):
   
-    global reuse_layer_to_ops
+    global reuse_layer_to_macs
     global reuse_layer_to_IP
     global reuse_layer_to_kxk
   
-    if op_name not in reuse_layer_to_ops.keys():
-      reuse_layer_to_ops[op_name] = 0
-    reuse_layer_to_ops[op_name] += total_ops
+    if op_name not in reuse_layer_to_macs.keys():
+      reuse_layer_to_macs[op_name] = 0
+    reuse_layer_to_macs[op_name] += total_macs
     reuse_layer_to_IP[op_name] = ip
     reuse_layer_to_kxk[op_name] = kxk
   
@@ -1379,7 +1380,7 @@ while(True):
       
       layer_OP = '{{{REUSE_NAME}}}_OP'
       if use_line_buffer(data_dims_str):
-        layer_DLP = 4
+        layer_DLP = layer_OP
         layer_WLP = 2 # Can make this 1, and then instead of layer_WLP/2 below, do max(1, layer_WLP/2)
         layer_SP = 4
       else:
@@ -1629,6 +1630,7 @@ while(True):
             half_kernel_size, B_par)
       # Load from SRAM
       else:
+        layer_IP = 1
         output_string += '''
           val ''' + weight_name + '''_SRAM = SRAM[T](''' + B_sram_dim + '''inCh*kr*kc).flat.noduplicate'''
         if weight_blocking:
@@ -2236,9 +2238,9 @@ while(True):
       file_opening   += dse_string_out
       
       unique_op_name = 'Fused_Conv2D_BiasAdd_MaxPool_k' + kernel_dims_str[0]
-      total_ops = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
+      total_macs = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
       kxk = int(kernel_dims_str[0])*int(kernel_dims_str[1])
-      register_layer_ops(unique_op_name, total_ops, layer_IP, kxk)
+      register_layer_ops(unique_op_name, total_macs, layer_IP, kxk)
       
       # Check if we need to handle edges
       if pool_padding == 'SAME':
@@ -2493,9 +2495,9 @@ while(True):
         file_opening   += dse_string_out
         accel_function += hw_block
 
-      total_ops = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
+      total_macs = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
       kxk = int(kernel_dims_str[0])*int(kernel_dims_str[1])
-      register_layer_ops(unique_op_name, total_ops, layer_IP, kxk)
+      register_layer_ops(unique_op_name, total_macs, layer_IP, kxk)
 
     # Otherwise it is unfused convolution
     else:
@@ -2692,9 +2694,9 @@ while(True):
         dse_string_out = dse_string_out.replace('{{{REUSE_NAME}}}', unique_op_name)
         register_new_reused_processor(unique_op_name, def_arg_values, hw_block, dse_string_out, \
           True, bias_tmpvar_inputs[1], tmpvar_inputs[1])          
-        total_ops = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
+        total_macs = out_height*out_width*int(kernel_dims_str[0])*int(kernel_dims_str[1])*int(kernel_dims_str[2])*int(kernel_dims_str[3])
         kxk = int(kernel_dims_str[0])*int(kernel_dims_str[1])
-        register_layer_ops(unique_op_name, total_ops, layer_IP, kxk)
+        register_layer_ops(unique_op_name, total_macs, layer_IP, kxk)
 
     # Otherwise it is unfused convolution
     else:
@@ -3846,29 +3848,145 @@ if reuse and reuse_layer_list:  # If there is at least one reused processor
 # ========================================================================================================
 # Static Model for DSP Assignment
 # ========================================================================================================
-if reuse_layer_to_ops.keys():
-  total_ops = 0
+
+# This solves:
+#
+#    MIN( T1/(ip1*X1) + T2/(ip2*X2) + .... + TM/(ipM*XM) )
+#
+# subject to:
+#
+#    ip1*X1 + ip2*X2 + ... + ipM*XM <= total,
+#    X1 >= 1,
+#    X2 >= 1,
+#    ...,
+#    XM >= 1
+#    
+# where X1, X2, ..., XM are integers, or alternatively powers of 2 (see below).
+# E.g. they would represent outer parallelism for a processor.
+#
+def constraint_solver(total, X_to_TdivIP, X_to_IP):
+  nvars = len(X_to_TdivIP.keys())
+  Xs = []
+  TdivIPs = []
+  IPs = []
+  for X in X_to_TdivIP.keys():
+    Xs.append(X)
+    TdivIPs.append(X_to_TdivIP[X])
+    IPs.append(X_to_IP[X])
+  
+  # Here a different solver can be swapped in if needed
+  # Also, it shouldn't really matter if Xs (outer parallelizations) are powers of 2
+  # For now, constrain to powers of 2 and use exhaustive search
+  constrain_to_powers_of_2 = True  
+  # If I set pars too big, there are sometimes JVM errors in Spatial.
+  # Here I avoid that by setting a max outer par of 8, but there may be
+  # a better way, e.g. take inner par into consideration as well.
+  max_allowed_par = 8
+  verbose = 0
+  
+  if verbose > 0:
+    print '----------------------------'
+    print 'Constraint solver details:'
+    print '----------------------------'
+    print 'Processors = ' + str(Xs)
+    print 'MAC / IP   = ' + str(TdivIPs)
+    print 'IP         = ' + str(IPs)    
+  
+  # Solve
+  global_min = None
+  best_solution = None
+  if constrain_to_powers_of_2:
+    # Create the search space
+    powers_of_2_up_to_total = [1]
+    max_par_to_assign = total
+    if max_allowed_par:
+      max_par_to_assign = max_allowed_par
+    while True:
+      next_pow2 = powers_of_2_up_to_total[-1]*2
+      if next_pow2 <= max_par_to_assign:
+        powers_of_2_up_to_total.append(next_pow2)
+      else:
+        break
+    nvalues = len(powers_of_2_up_to_total)
+    from itertools import product
+    search_space = product(powers_of_2_up_to_total, repeat=nvars)
+    search_space_pruned = []
+    for solution in list(search_space):
+      solution_sum = 0
+      for i in range(nvars):
+        solution_sum += IPs[i]*solution[i]
+      if solution_sum <= total:
+        search_space_pruned.append(solution)
+  
+    # Perform the search
+    for current_solution in search_space_pruned:
+      # Calculate objective
+      objective = 0
+      for i in range(nvars):
+        objective += float(TdivIPs[i]) / float(current_solution[i])      
+      if verbose > 1:
+        print 'Candidate solution: ' + str(current_solution) + ', objective = ' + str(objective)
+      # Compare to global min
+      if not global_min or objective < global_min:
+        global_min = objective
+        best_solution = current_solution        
+  else:
+    utils.error_exit('Currently powers of 2 required for static model')
+  
+  if verbose > 0:
+    print 'Best solution = ' + str(best_solution)
+    print  
+  X_to_assignments = {}
+  for i in range(nvars):
+    X_to_assignments[Xs[i]] = str(best_solution[i])
+  return X_to_assignments
+
+# Note: MACs (multiply-accumulates) is used here instead of "ops" (operations) because 
+# "operation" is also used to denote a set of fused layers implemented by a single
+# processor (i.e. a coarse-grained operation). Also, op can be confused with outer parallelism.
+# But essentially 1 MAC = 2 ops in the sense of GFLOPS, etc.
+if reuse_layer_to_macs.keys():
+  total_macs = 0
   max_name_length = 0
-  for layer in reuse_layer_to_ops.keys():
-    total_ops += reuse_layer_to_ops[layer]
+  for layer in reuse_layer_to_macs.keys():
+    total_macs += reuse_layer_to_macs[layer]
     max_name_length = max(max_name_length, len(layer))
   print
   
   dsp_util_target = 1.0
   mults_to_assign = int( dsp_util_target * float(device_params['num_dsps']) / float( device_params['dsp_usage_per_32b_mul'] ) )
+  # print mults_to_assign
   
-  print 'MAC % by op:'
-  for layer in reuse_layer_to_ops.keys():
+  layer_to_percent_of_macs = {}  # map a reused layer (e.g. a 3x3 layer) to the % of total MACs in the DNN from all instances of this layer
+  layers_for_static_model = []
+  print 'MAC % by coarse-grained operation type:'
+  for layer in reuse_layer_to_macs.keys():
     spaces = ' '*(max_name_length - len(layer)) + ' : '
-    percent_for_op = float(reuse_layer_to_ops[layer])/float(total_ops)
-    print '  ' + layer + spaces + str(100.*percent_for_op)[0:5] + '%  (' + str(reuse_layer_to_ops[layer]) + ' / ' + str(total_ops) + ')'
+    percent_for_layer = float(reuse_layer_to_macs[layer])/float(total_macs)
+    print '  ' + layer + spaces + str(100.*percent_for_layer)[0:5] + '%  (' + str(reuse_layer_to_macs[layer]) + ' / ' + str(total_macs) + ')'
+    layer_to_percent_of_macs[layer] = percent_for_layer
     if layer in reuse_layer_to_IP.keys() and layer in reuse_layer_to_kxk.keys():
-      # Spatial currently has JVM code size errors for large outer pars. The line below should be used here:
-      # par_alloc = str(closest_pow_2(mults_to_assign * percent_for_op / reuse_layer_to_IP[layer] / reuse_layer_to_kxk[layer]))
-      # But until that is fixed, limiting the outer par to 8 here:
-      par_alloc = str(min(8, closest_pow_2(mults_to_assign * percent_for_op / reuse_layer_to_IP[layer] / reuse_layer_to_kxk[layer])))
-      file_opening = file_opening.replace(layer + '_OP', par_alloc)
+      layers_for_static_model.append(layer)
   print
+  
+  if use_constraint_solver:
+    layer_to_cycles_after_IP = {}
+    layer_to_IP = {}
+    for layer in layers_for_static_model:
+      # Could also use layer_to_percent_of_macs here instead of reuse_layer_to_macs, just scaled by constant
+      layer_to_cycles_after_IP[layer] = float(reuse_layer_to_macs[layer]) / reuse_layer_to_IP[layer] / reuse_layer_to_kxk[layer]
+      layer_to_IP[layer] = reuse_layer_to_IP[layer] * reuse_layer_to_kxk[layer]
+    layer_pars = constraint_solver(mults_to_assign, layer_to_cycles_after_IP, layer_to_IP)
+    for layer in layer_pars.keys():
+      file_opening = file_opening.replace(layer + '_OP', layer_pars[layer])
+  else:
+    for layer in layers_for_static_model:
+      # Spatial currently has JVM code size errors for large outer pars. The line below should be used here:
+      # par_alloc = str(closest_pow_2(mults_to_assign * layer_to_percent_of_macs[layer] / reuse_layer_to_IP[layer] / reuse_layer_to_kxk[layer]))
+      # But until that is fixed, limiting the outer par to 8 here:
+      par_alloc = str(min(8, closest_pow_2(mults_to_assign * layer_to_percent_of_macs[layer] / reuse_layer_to_IP[layer] / reuse_layer_to_kxk[layer])))
+      # print layer + ' -> ' + str(par_alloc)
+      file_opening = file_opening.replace(layer + '_OP', par_alloc)
   
 
 # ========================================================================================================
